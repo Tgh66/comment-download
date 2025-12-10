@@ -1,171 +1,333 @@
 import streamlit as st
+import asyncio
 import pandas as pd
-from io import BytesIO
-from reportlab.pdfgen import canvas
+import re
+import time
+import requests
+import json
+import urllib.parse
+import io # 新增：用于处理字节流
+from bilibili_api import video, comment, Credential
+from bilibili_api.exceptions import ResponseCodeException
+
+# --- PDF 生成相关库 ---
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTF
-import time
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib import colors
 
-# ==========================================
-# 第一部分：你现有的核心逻辑 (保持不变)
-# ==========================================
+# --- 页面配置 ---
+st.set_page_config(page_title="B站评论抓取神器 (排序+PDF版)", page_icon="🍪", layout="wide")
 
-# 假设这是你现有的爬虫函数，你需要确保它返回包含 'likes' (点赞数) 的字典
-# 如果你现在的代码只是 print 出来，请修改它让它 return 一个字典
-def existing_scraper_function(url, cookies=None):
-    """
-    这里代表你现有的复杂逻辑：
-    1. 识别是B站/抖音/Youtube
-    2. 使用Cookie认证
-    3. 解析视频信息
-    """
-    # 模拟返回的数据结构 (请确保你的爬虫提取了 'likes' 字段)
-    # 注意：点赞数必须是数字类型 (int)，如果是字符串 '1.2万' 需要转换
-    
-    # -------------------------------------------------
-    # ⚠️在此处保留你的实际代码，不要使用下面的模拟代码⚠️
-    # -------------------------------------------------
-    import random
-    # 模拟数据仅供演示排序功能
-    mock_data = {
-        "title": f"测试视频标题 - {url[-5:]}",
-        "url": url,
-        "author": "测试作者",
-        "likes": random.randint(100, 100000), # 关键字段：点赞数
-        "platform": "Bilibili" if "bilibili" in url else "Other"
-    }
-    time.sleep(0.5) # 模拟请求耗时
-    return mock_data
+# --- 辅助函数 ---
 
-# ==========================================
-# 第二部分：新增的 PDF 生成工具函数
-# ==========================================
+def get_real_url(url):
+    """处理 b23.tv 短链接"""
+    if "b23.tv" in url:
+        try:
+            headers = {"User-Agent": "Mozilla/5.0"}
+            resp = requests.get(url, headers=headers, allow_redirects=True, timeout=10)
+            return resp.url
+        except:
+            return url
+    return url
 
-def generate_pdf(dataframe):
-    buffer = BytesIO()
-    p = canvas.Canvas(buffer, pagesize=A4)
-    width, height = A4
-    y = height - 40
-    
-    # 注意：ReportLab默认不支持中文，需要注册字体。
-    # 为了防止报错，这里用通用处理，实际部署建议下载 'SimHei.ttf' 并注册
-    # 或者仅在PDF中输出英文/数字，中文可能显示乱码
-    p.setFont("Helvetica", 10) 
-    
-    p.drawString(30, y, "Video Export List")
-    y -= 20
-    
-    for index, row in dataframe.iterrows():
-        if y < 40: # 换页处理
-            p.showPage()
-            p.setFont("Helvetica", 10)
-            y = height - 40
-            
-        # 简单写入 标题 (截断以防过长) 和 点赞数
-        # 实际项目中建议处理中文字体
-        title_text = str(row['title'])[:40] 
-        text = f"Title: {title_text}... | Likes: {row['likes']} | URL: {row['url']}"
-        p.drawString(30, y, text)
-        y -= 20
+def extract_bv(url):
+    """提取BV号"""
+    real_url = get_real_url(url)
+    pattern = r"(BV[a-zA-Z0-9]{10})"
+    match = re.search(pattern, real_url)
+    if match:
+        return match.group(1), real_url
+    return None, real_url
+
+def parse_cookie_json(json_str):
+    """解析用户粘贴的 JSON Cookie 数据"""
+    try:
+        data = json.loads(json_str)
         
-    p.save()
-    buffer.seek(0)
-    return buffer
+        cookie_list = []
+        if isinstance(data, list):
+            cookie_list = data
+        elif isinstance(data, dict) and "cookies" in data:
+            cookie_list = data["cookies"]
+        else:
+            return None, "JSON 格式不正确，未找到 cookies 列表"
 
-# ==========================================
-# 第三部分：Streamlit 主界面逻辑 (修改部分)
-# ==========================================
+        cookies = {c['name']: c['value'] for c in cookie_list}
+        
+        sessdata = cookies.get('SESSDATA')
+        bili_jct = cookies.get('bili_jct')
+        buvid3 = cookies.get('buvid3')
 
-st.title("多平台视频抓取工具 (含排序导出)")
+        if not sessdata or not bili_jct:
+            return None, "Cookie 中缺少 SESSDATA 或 bili_jct"
 
-# 输入区域
-urls_input = st.text_area("请输入视频链接 (一行一个):")
-run_button = st.button("开始抓取")
+        sessdata = urllib.parse.unquote(sessdata)
+        bili_jct = urllib.parse.unquote(bili_jct)
 
-# 初始化 session_state 用于存储抓取结果，防止排序时重刷消失
-if 'scraped_data' not in st.session_state:
-    st.session_state.scraped_data = []
+        cred = Credential(sessdata=sessdata, bili_jct=bili_jct, buvid3=buvid3)
+        return cred, None
 
-if run_button and urls_input:
-    url_list = urls_input.split('\n')
-    results = []
+    except json.JSONDecodeError:
+        return None, "JSON 解析失败，请检查复制是否完整"
+    except Exception as e:
+        return None, f"Cookie 解析错误: {str(e)}"
+
+# --- PDF 生成函数 ---
+def create_pdf(dataframe, title):
+    """
+    将 DataFrame 转换为 PDF 字节流
+    """
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4)
+    elements = []
+
+    # 1. 尝试注册中文字体 (Windows通常有SimHei，Mac/Linux可能需要手动指定)
+    font_name = "Helvetica" # 默认字体（不支持中文）
+    try:
+        # 尝试使用 Windows 常见黑体
+        pdfmetrics.registerFont(TTF('SimHei', 'simhei.ttf'))
+        font_name = 'SimHei'
+    except:
+        try:
+            # 尝试使用 微软雅黑 (如果是Windows)
+            pdfmetrics.registerFont(TTF('Microsoft YaHei', 'msyh.ttf'))
+            font_name = 'Microsoft YaHei'
+        except:
+            # 如果都没有，不做处理，可能会乱码，但保证不报错
+            pass
+
+    # 2. 准备标题
+    styles = getSampleStyleSheet()
+    title_style = styles['Title']
+    if font_name != "Helvetica":
+        title_style.fontName = font_name
+    
+    # 清理标题中的非法字符
+    safe_title = re.sub(r'[^\w\s\u4e00-\u9fa5]', '', title)
+    elements.append(Paragraph(f"视频评论: {safe_title}", title_style))
+    elements.append(Paragraph("<br/><br/>", styles['Normal']))
+
+    # 3. 准备表格数据
+    # 将 DataFrame 转换为列表列表，包含表头
+    data = [dataframe.columns.to_list()] + dataframe.values.tolist()
+
+    # 处理过长的内容，避免表格爆炸 (截断长评论)
+    processed_data = []
+    for row in data:
+        new_row = []
+        for item in row:
+            str_item = str(item)
+            # 如果内容太长，截取前50个字
+            if len(str_item) > 50:
+                str_item = str_item[:50] + "..."
+            # 移除 PDF 不支持的字符（如某些Emoji）以免报错
+            str_item = re.sub(r'[^\x00-\x7F\u4e00-\u9fa5]+', '', str_item) 
+            new_row.append(str_item)
+        processed_data.append(new_row)
+
+    # 4. 创建表格对象
+    t = Table(processed_data)
+    
+    # 5. 设置表格样式
+    style = TableStyle([
+        ('FONTNAME', (0, 0), (-1, -1), font_name), # 应用字体
+        ('BACKGROUND', (0, 0), (-1, 0), colors.grey), # 表头背景
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke), # 表头文字颜色
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('FONTSIZE', (0, 0), (-1, 0), 10),
+        ('FONTSIZE', (0, 0), (-1, -1), 8),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+        ('GRID', (0, 0), (-1, -1), 1, colors.black),
+    ])
+    t.setStyle(style)
+    elements.append(t)
+
+    # 6. 生成 PDF
+    try:
+        doc.build(elements)
+        buffer.seek(0)
+        return buffer
+    except Exception as e:
+        return None
+
+# 👇 【核心修复】定义一个自定义类，完美骗过库的检查
+class VideoTypeFix:
+    value = 1  # 视频类型 ID 为 1
+
+async def fetch_comments_async(bv_id, limit_pages, credential=None):
+    """
+    异步抓取评论
+    """
+    v = video.Video(bvid=bv_id, credential=credential)
+    
+    try:
+        info = await v.get_info()
+        oid = info['aid']
+        title = info['title']
+    except Exception as e:
+        return None, f"无法获取视频信息: {str(e)}"
+
+    comments_data = []
+    page = 1
     
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    # 1. 执行抓取
-    for i, url in enumerate(url_list):
-        if url.strip():
-            status_text.text(f"正在分析: {url}")
+    try:
+        while page <= limit_pages:
+            status_text.text(f"🚀 正在抓取第 {page}/{limit_pages} 页...")
+            
             try:
-                # 调用你现有的逻辑
-                data = existing_scraper_function(url.strip())
-                if data:
-                    results.append(data)
+                # 👇 【关键修改】使用自定义对象 VideoTypeFix() 代替数字 1
+                c = await comment.get_comments(oid, VideoTypeFix(), page, credential=credential)
+            except ResponseCodeException as e:
+                if e.code == -404: break
+                st.warning(f"API 错误代码: {e.code}")
+                break
             except Exception as e:
-                st.error(f"链接 {url} 解析失败: {e}")
-        progress_bar.progress((i + 1) / len(url_list))
-    
-    # 存入 Session State
-    st.session_state.scraped_data = results
-    status_text.text("分析完成！")
+                st.warning(f"未知错误: {e}")
+                break
 
-# 2. 结果展示与处理区域
-if st.session_state.scraped_data:
-    st.divider()
-    st.subheader("📊 结果分析")
-    
-    # 将列表转换为 Pandas DataFrame
-    df = pd.DataFrame(st.session_state.scraped_data)
-    
-    # --- 新增功能：排序控制 ---
-    col1, col2 = st.columns([1, 3])
-    with col1:
-        sort_method = st.radio(
-            "按照点赞数排序:",
-            ("降序 (从高到低)", "升序 (从低到高)")
-        )
-    
-    # 执行排序逻辑
-    ascending_bool = True if "升序" in sort_method else False
-    if 'likes' in df.columns:
-        df = df.sort_values(by='likes', ascending=ascending_bool)
-        # 重置索引，让序号从1开始
-        df = df.reset_index(drop=True)
-    else:
-        st.warning("未检测到'likes'字段，无法排序。请检查爬虫返回值。")
+            if 'replies' not in c or not c['replies']:
+                status_text.text("✅ 已到达底部")
+                break
+            
+            for r in c['replies']:
+                item = {
+                    '用户名': r['member']['uname'],
+                    '内容': r['content']['message'],
+                    '点赞': int(r['like']), # 确保转换为数字，方便排序
+                    '时间': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(r['ctime'])),
+                    '回复数': int(r['count'])
+                }
+                comments_data.append(item)
+                
+                if r.get('replies'):
+                    for sub in r['replies']:
+                        sub_item = {
+                            '用户名': sub['member']['uname'],
+                            '内容': f"[回复] {sub['content']['message']}",
+                            '点赞': int(sub['like']),
+                            '时间': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(sub['ctime'])),
+                            '回复数': 0
+                        }
+                        comments_data.append(sub_item)
 
-    # 显示表格
-    st.dataframe(
-        df, 
-        column_config={
-            "url": st.column_config.LinkColumn("视频链接"),
-            "likes": st.column_config.NumberColumn("点赞数", format="%d")
-        },
-        use_container_width=True
+            progress_bar.progress(min(page / limit_pages, 1.0))
+            page += 1
+            await asyncio.sleep(0.5)
+            
+    except Exception as e:
+        st.error(f"中断: {e}")
+    
+    return title, comments_data
+
+# --- UI 布局 ---
+
+st.title("🍪 B站评论抓取 (排序+PDF版)")
+
+with st.sidebar:
+    st.header("🔐 身份验证 (推荐)")
+    st.info("粘贴 Cookie JSON")
+    
+    cookie_input = st.text_area(
+        "Cookie 数据:", 
+        height=150,
+        placeholder='{"url": "...", "cookies": [...]}'
     )
-
-    # --- 新增功能：导出下载 ---
-    st.subheader("💾 数据导出")
-    d_col1, d_col2 = st.columns(2)
     
-    # 导出 CSV
-    csv_data = df.to_csv(index=False).encode('utf-8-sig') # utf-8-sig 解决Excel中文乱码
-    with d_col1:
-        st.download_button(
-            label="下载 CSV 表格",
-            data=csv_data,
-            file_name='video_stats.csv',
-            mime='text/csv',
-        )
-        
-    # 导出 PDF
-    with d_col2:
-        pdf_data = generate_pdf(df)
-        st.download_button(
-            label="下载 PDF 报告",
-            data=pdf_data,
-            file_name='video_stats.pdf',
-            mime='application/pdf',
-        )
+    cred = None
+    if cookie_input:
+        cred, err_msg = parse_cookie_json(cookie_input)
+        if cred:
+            st.success("✅ Cookie 解析成功！")
+        else:
+            st.error(f"❌ {err_msg}")
+            
+    st.divider()
+    max_pages = st.slider("抓取页数", 1, 100, 5)
+
+url_input = st.text_input("👇 视频链接", placeholder="https://b23.tv/...")
+
+if st.button("开始抓取", type="primary"):
+    if not url_input:
+        st.warning("请输入链接")
+    else:
+        bv_id, real_url = extract_bv(url_input)
+        if not bv_id:
+            st.error("无法识别 BV 号")
+        else:
+            st.success(f"正在抓取: {bv_id}")
+            
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            
+            title, data = loop.run_until_complete(fetch_comments_async(bv_id, max_pages, credential=cred))
+            
+            if isinstance(data, str):
+                st.error(data)
+            elif data:
+                st.divider()
+                st.subheader(f"📄 {title}")
+                
+                # --- 新增功能：排序与处理 ---
+                df = pd.DataFrame(data)
+                
+                # 布局容器：左边展示数据，右边放下载按钮和排序
+                col1, col2 = st.columns([3, 1])
+                
+                with col2:
+                    st.markdown("### 🛠️ 数据选项")
+                    
+                    # 1. 排序选择
+                    sort_order = st.radio(
+                        "排序方式 (按点赞)",
+                        ("默认 (时间)", "点赞数 (高到低)", "点赞数 (低到高)")
+                    )
+                    
+                    # 2. 应用排序
+                    if sort_order == "点赞数 (高到低)":
+                        df = df.sort_values(by="点赞", ascending=False)
+                    elif sort_order == "点赞数 (低到高)":
+                        df = df.sort_values(by="点赞", ascending=True)
+                    
+                    st.write(f"共抓取 {len(df)} 条评论")
+                    
+                    # 3. CSV 下载
+                    csv = df.to_csv(index=False).encode('utf-8-sig')
+                    st.download_button(
+                        label="📥 下载 CSV",
+                        data=csv,
+                        file_name=f"{bv_id}_comments.csv",
+                        mime="text/csv"
+                    )
+                    
+                    # 4. PDF 下载 (带状态提示)
+                    st.write("---")
+                    if st.button("生成 PDF"):
+                        with st.spinner("正在生成 PDF (可能需要几秒)..."):
+                            pdf_buffer = create_pdf(df, title)
+                            if pdf_buffer:
+                                st.success("PDF 生成成功！请点击下方按钮下载")
+                                st.download_button(
+                                    label="📥 点击下载 PDF",
+                                    data=pdf_buffer,
+                                    file_name=f"{bv_id}_comments.pdf",
+                                    mime="application/pdf"
+                                )
+                            else:
+                                st.error("PDF 生成失败，可能因包含特殊字符或字体问题。")
+
+                with col1:
+                    # 展示表格
+                    st.dataframe(df, use_container_width=True, height=500)
+                
+            else:
+                st.warning("未抓取到数据。")
