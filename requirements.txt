@@ -2,3 +2,4 @@ streamlit
 bilibili-api-python
 pandas
 requests
+httpx
