@@ -14,7 +14,6 @@ from bilibili_api.exceptions import ResponseCodeException
 # --- PDF 生成相关库 ---
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTF
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib import colors
