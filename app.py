@@ -5,7 +5,8 @@ import re
 import time
 import requests
 from bilibili_api import video, comment
-from bilibili_api.exception import ResponseCodeException
+# 👇 【修正点】这里改为 exceptions (复数)
+from bilibili_api.exceptions import ResponseCodeException 
 
 # --- 页面配置 ---
 st.set_page_config(page_title="B站评论抓取神器", page_icon="📝", layout="centered")
@@ -78,7 +79,13 @@ async def fetch_comments_async(bv_id, limit_pages=5):
                 if e.code == -404: 
                     break 
                 else:
-                    raise e
+                    # 如果遇到其他 API 错误，记录并继续或退出
+                    st.warning(f"API 返回错误代码: {e.code}，停止翻页。")
+                    break
+            except Exception as e:
+                # 捕获其他未知错误
+                st.warning(f"抓取页数 {page} 时发生未知错误: {e}")
+                break
 
             # 检查是否有评论内容
             if 'replies' not in c or not c['replies']:
@@ -158,9 +165,15 @@ if st.button("开始抓取", type="primary"):
             st.caption(f"解析后地址: {real_url}")
             
             # 2. 运行异步抓取
-            # 在 Streamlit 中运行 asyncio 需要新建循环或使用 asyncio.run
             try:
-                title, data = asyncio.run(fetch_comments_async(bv_id, max_pages))
+                # 修复 Python 3.10+ 环境下可能的事件循环问题
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                
+                title, data = loop.run_until_complete(fetch_comments_async(bv_id, max_pages))
                 
                 if isinstance(data, str): # 如果返回的是错误信息
                     st.error(data)
