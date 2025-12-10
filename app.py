@@ -10,7 +10,7 @@ from bilibili_api import video, comment, Credential
 from bilibili_api.exceptions import ResponseCodeException
 
 # --- 页面配置 ---
-st.set_page_config(page_title="B站评论抓取神器 (登录版)", page_icon="🍪", layout="wide")
+st.set_page_config(page_title="B站评论抓取神器 (最终版)", page_icon="🍪", layout="wide")
 
 # --- 辅助函数 ---
 
@@ -39,10 +39,8 @@ def parse_cookie_json(json_str):
     解析用户粘贴的 JSON Cookie 数据
     """
     try:
-        # 1. 尝试解析 JSON
         data = json.loads(json_str)
         
-        # 兼容两种格式：一种是列表 [...]，一种是包含 cookies 字段的对象 {...}
         cookie_list = []
         if isinstance(data, list):
             cookie_list = data
@@ -51,7 +49,6 @@ def parse_cookie_json(json_str):
         else:
             return None, "JSON 格式不正确，未找到 cookies 列表"
 
-        # 2. 提取关键字段
         cookies = {c['name']: c['value'] for c in cookie_list}
         
         sessdata = cookies.get('SESSDATA')
@@ -59,13 +56,11 @@ def parse_cookie_json(json_str):
         buvid3 = cookies.get('buvid3')
 
         if not sessdata or not bili_jct:
-            return None, "Cookie 中缺少 SESSDATA 或 bili_jct，请确保已登录 B 站"
+            return None, "Cookie 中缺少 SESSDATA 或 bili_jct"
 
-        # 3. 解码 (防止 URL 编码导致签名错误)
         sessdata = urllib.parse.unquote(sessdata)
         bili_jct = urllib.parse.unquote(bili_jct)
 
-        # 4. 生成凭证对象
         cred = Credential(sessdata=sessdata, bili_jct=bili_jct, buvid3=buvid3)
         return cred, None
 
@@ -76,13 +71,11 @@ def parse_cookie_json(json_str):
 
 async def fetch_comments_async(bv_id, limit_pages, credential=None):
     """
-    异步抓取评论 (支持鉴权)
+    异步抓取评论 (已修复 ResourceType 错误)
     """
-    # 初始化视频对象，注入凭证
     v = video.Video(bvid=bv_id, credential=credential)
     
     try:
-        # 获取视频信息
         info = await v.get_info()
         oid = info['aid']
         title = info['title']
@@ -100,8 +93,9 @@ async def fetch_comments_async(bv_id, limit_pages, credential=None):
             status_text.text(f"🚀 正在抓取第 {page}/{limit_pages} 页...")
             
             try:
-                # 获取评论
-                c = await comment.get_comments(oid, comment.ResourceType.VIDEO, page, credential=credential)
+                # 修复核心：直接使用数字 1 代表视频评论类型，避免 AttributeError
+                # type_=1 (视频), type_=12 (专栏), type_=17 (动态)
+                c = await comment.get_comments(oid, 1, page, credential=credential)
             except ResponseCodeException as e:
                 if e.code == -404: break
                 st.warning(f"API 错误代码: {e.code}")
@@ -115,18 +109,15 @@ async def fetch_comments_async(bv_id, limit_pages, credential=None):
                 break
             
             for r in c['replies']:
-                # 主评论
                 item = {
                     '用户名': r['member']['uname'],
                     '内容': r['content']['message'],
                     '点赞': r['like'],
                     '时间': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(r['ctime'])),
-                    '楼层': r.get('floor', 0),
                     '回复数': r['count']
                 }
                 comments_data.append(item)
                 
-                # 楼中楼
                 if r.get('replies'):
                     for sub in r['replies']:
                         sub_item = {
@@ -134,14 +125,13 @@ async def fetch_comments_async(bv_id, limit_pages, credential=None):
                             '内容': f"[回复] {sub['content']['message']}",
                             '点赞': sub['like'],
                             '时间': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(sub['ctime'])),
-                            '楼层': sub.get('floor', 0),
                             '回复数': 0
                         }
                         comments_data.append(sub_item)
 
             progress_bar.progress(min(page / limit_pages, 1.0))
             page += 1
-            await asyncio.sleep(0.5) # 有 Cookie 可以稍微快一点点
+            await asyncio.sleep(0.5)
             
     except Exception as e:
         st.error(f"中断: {e}")
@@ -152,10 +142,9 @@ async def fetch_comments_async(bv_id, limit_pages, credential=None):
 
 st.title("🍪 B站评论抓取 (含登录)")
 
-# 侧边栏：Cookie 配置
 with st.sidebar:
     st.header("🔐 身份验证 (推荐)")
-    st.info("粘贴 Cookie 可以大幅提高抓取成功率并减少风控。")
+    st.info("粘贴 Cookie 可以大幅提高抓取成功率。")
     
     cookie_input = st.text_area(
         "在此粘贴 Cookie JSON 数据:", 
@@ -167,14 +156,13 @@ with st.sidebar:
     if cookie_input:
         cred, err_msg = parse_cookie_json(cookie_input)
         if cred:
-            st.success("✅ Cookie 解析成功！已启用身份验证。")
+            st.success("✅ Cookie 解析成功！")
         else:
             st.error(f"❌ {err_msg}")
             
     st.divider()
     max_pages = st.slider("抓取页数", 1, 100, 5)
 
-# 主界面
 url_input = st.text_input("👇 视频链接 (支持短链)", placeholder="https://b23.tv/...")
 
 if st.button("开始抓取", type="primary"):
@@ -187,14 +175,12 @@ if st.button("开始抓取", type="primary"):
         else:
             st.success(f"正在抓取: {bv_id}")
             
-            # 解决事件循环问题
             try:
                 loop = asyncio.get_event_loop()
             except RuntimeError:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
             
-            # 运行抓取
             title, data = loop.run_until_complete(fetch_comments_async(bv_id, max_pages, credential=cred))
             
             if isinstance(data, str):
