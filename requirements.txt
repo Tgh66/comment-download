@@ -3,3 +3,7 @@ bilibili-api-python
 pandas
 requests
 httpx
+reportlab
+python-docx
+openpyxl
+pandas
