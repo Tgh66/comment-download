@@ -76,7 +76,7 @@ def parse_cookie_json(json_str):
     except Exception as e:
         return None, f"Cookie 解析错误: {str(e)}"
 
-# --- PDF 生成函数 ---
+# --- PDF 生成函数 (修复字体路径版) ---
 def create_pdf(dataframe, title):
     """
     将 DataFrame 转换为 PDF 字节流
@@ -85,46 +85,53 @@ def create_pdf(dataframe, title):
     doc = SimpleDocTemplate(buffer, pagesize=A4)
     elements = []
 
-    # 1. 尝试注册中文字体 (Windows通常有SimHei，Mac/Linux可能需要手动指定)
-    font_name = "Helvetica" # 默认字体（不支持中文）
-    try:
-        # 尝试使用 Windows 常见黑体
-        pdfmetrics.registerFont(TTF('SimHei', 'simhei.ttf'))
-        font_name = 'SimHei'
-    except:
+    # 1. 注册字体 (核心修改：优先读取项目目录下的字体文件)
+    font_name = "Helvetica" # 默认英文作为保底
+    
+    # 你的字体文件名，必须和你上传到 GitHub 的文件名完全一致！
+    font_file = "SimHei.ttf" 
+    
+    # 获取当前脚本所在的绝对路径，确保在云端也能找到文件
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    font_path = os.path.join(current_dir, font_file)
+
+    if os.path.exists(font_path):
         try:
-            # 尝试使用 微软雅黑 (如果是Windows)
-            pdfmetrics.registerFont(TTF('Microsoft YaHei', 'msyh.ttf'))
-            font_name = 'Microsoft YaHei'
+            # 注册项目文件夹里的字体
+            pdfmetrics.registerFont(TTF('SimHei', font_path))
+            font_name = 'SimHei'
+        except Exception as e:
+            print(f"字体注册失败: {e}")
+    else:
+        # 如果找不到文件，尝试系统的（本地调试用）
+        try:
+            pdfmetrics.registerFont(TTF('SimHei', 'simhei.ttf')) # Windows 默认路径尝试
+            font_name = 'SimHei'
         except:
-            # 如果都没有，不做处理，可能会乱码，但保证不报错
             pass
 
     # 2. 准备标题
     styles = getSampleStyleSheet()
     title_style = styles['Title']
-    if font_name != "Helvetica":
+    # 如果加载了中文体，应用到标题
+    if font_name == 'SimHei':
         title_style.fontName = font_name
     
-    # 清理标题中的非法字符
     safe_title = re.sub(r'[^\w\s\u4e00-\u9fa5]', '', title)
     elements.append(Paragraph(f"视频评论: {safe_title}", title_style))
     elements.append(Paragraph("<br/><br/>", styles['Normal']))
 
     # 3. 准备表格数据
-    # 将 DataFrame 转换为列表列表，包含表头
     data = [dataframe.columns.to_list()] + dataframe.values.tolist()
 
-    # 处理过长的内容，避免表格爆炸 (截断长评论)
     processed_data = []
     for row in data:
         new_row = []
         for item in row:
             str_item = str(item)
-            # 如果内容太长，截取前50个字
             if len(str_item) > 50:
                 str_item = str_item[:50] + "..."
-            # 移除 PDF 不支持的字符（如某些Emoji）以免报错
+            # 清理特殊字符
             str_item = re.sub(r'[^\x00-\x7F\u4e00-\u9fa5]+', '', str_item) 
             new_row.append(str_item)
         processed_data.append(new_row)
@@ -134,9 +141,9 @@ def create_pdf(dataframe, title):
     
     # 5. 设置表格样式
     style = TableStyle([
-        ('FONTNAME', (0, 0), (-1, -1), font_name), # 应用字体
-        ('BACKGROUND', (0, 0), (-1, 0), colors.grey), # 表头背景
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke), # 表头文字颜色
+        ('FONTNAME', (0, 0), (-1, -1), font_name), # 全局应用该字体
+        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
         ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
         ('FONTSIZE', (0, 0), (-1, 0), 10),
         ('FONTSIZE', (0, 0), (-1, -1), 8),
@@ -152,6 +159,7 @@ def create_pdf(dataframe, title):
         buffer.seek(0)
         return buffer
     except Exception as e:
+        print(f"PDF生成错误: {e}")
         return None
 
 # 👇 【核心修复】定义一个自定义类，完美骗过库的检查
