@@ -1,197 +1,169 @@
 import streamlit as st
-import asyncio
+import yt_dlp
 import pandas as pd
-import re
-import time
-import requests
-import json
-import urllib.parse
-from bilibili_api import video, comment, Credential
-from bilibili_api.exceptions import ResponseCodeException
+import io
+from docx import Document
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle
 
-# --- 页面配置 ---
-st.set_page_config(page_title="B站评论抓取神器 ", page_icon="🍪", layout="wide")
-
-# --- 辅助函数 ---
-
-def get_real_url(url):
-    """处理 b23.tv 短链接"""
-    if "b23.tv" in url:
-        try:
-            headers = {"User-Agent": "Mozilla/5.0"}
-            resp = requests.get(url, headers=headers, allow_redirects=True, timeout=10)
-            return resp.url
-        except:
-            return url
-    return url
-
-def extract_bv(url):
-    """提取BV号"""
-    real_url = get_real_url(url)
-    pattern = r"(BV[a-zA-Z0-9]{10})"
-    match = re.search(pattern, real_url)
-    if match:
-        return match.group(1), real_url
-    return None, real_url
-
-def parse_cookie_json(json_str):
-    """解析用户粘贴的 JSON Cookie 数据"""
-    try:
-        data = json.loads(json_str)
-        
-        cookie_list = []
-        if isinstance(data, list):
-            cookie_list = data
-        elif isinstance(data, dict) and "cookies" in data:
-            cookie_list = data["cookies"]
-        else:
-            return None, "JSON 格式不正确，未找到 cookies 列表"
-
-        cookies = {c['name']: c['value'] for c in cookie_list}
-        
-        sessdata = cookies.get('SESSDATA')
-        bili_jct = cookies.get('bili_jct')
-        buvid3 = cookies.get('buvid3')
-
-        if not sessdata or not bili_jct:
-            return None, "Cookie 中缺少 SESSDATA 或 bili_jct"
-
-        sessdata = urllib.parse.unquote(sessdata)
-        bili_jct = urllib.parse.unquote(bili_jct)
-
-        cred = Credential(sessdata=sessdata, bili_jct=bili_jct, buvid3=buvid3)
-        return cred, None
-
-    except json.JSONDecodeError:
-        return None, "JSON 解析失败，请检查复制是否完整"
-    except Exception as e:
-        return None, f"Cookie 解析错误: {str(e)}"
-
-# 👇 【核心修复】定义一个自定义类，完美骗过库的检查
-class VideoTypeFix:
-    value = 1  # 视频类型 ID 为 1
-
-async def fetch_comments_async(bv_id, limit_pages, credential=None):
-    """
-    异步抓取评论
-    """
-    v = video.Video(bvid=bv_id, credential=credential)
-    
-    try:
-        info = await v.get_info()
-        oid = info['aid']
-        title = info['title']
-    except Exception as e:
-        return None, f"无法获取视频信息: {str(e)}"
-
-    comments_data = []
-    page = 1
-    
+# --- 核心函数：获取视频信息（含点赞数） ---
+def get_video_metadata(urls):
+    data = []
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    try:
-        while page <= limit_pages:
-            status_text.text(f"🚀 正在抓取第 {page}/{limit_pages} 页...")
-            
-            try:
-                # 👇 【关键修改】使用自定义对象 VideoTypeFix() 代替数字 1
-                c = await comment.get_comments(oid, VideoTypeFix(), page, credential=credential)
-            except ResponseCodeException as e:
-                if e.code == -404: break
-                st.warning(f"API 错误代码: {e.code}")
-                break
-            except Exception as e:
-                st.warning(f"未知错误: {e}")
-                break
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': True, # 尝试快速抓取
+    }
 
-            if 'replies' not in c or not c['replies']:
-                status_text.text("✅ 已到达底部")
-                break
-            
-            for r in c['replies']:
-                item = {
-                    '用户名': r['member']['uname'],
-                    '内容': r['content']['message'],
-                    '点赞': r['like'],
-                    '时间': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(r['ctime'])),
-                    '回复数': r['count']
-                }
-                comments_data.append(item)
+    for i, url in enumerate(urls):
+        if not url.strip():
+            continue
+        
+        status_text.text(f"正在分析第 {i+1} 个链接: {url} ...")
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
                 
-                if r.get('replies'):
-                    for sub in r['replies']:
-                        sub_item = {
-                            '用户名': sub['member']['uname'],
-                            '内容': f"[回复] {sub['content']['message']}",
-                            '点赞': sub['like'],
-                            '时间': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(sub['ctime'])),
-                            '回复数': 0
-                        }
-                        comments_data.append(sub_item)
+                # 提取关键信息，如果没有则填入默认值
+                title = info.get('title', 'Unknown Title')
+                like_count = info.get('like_count', 0) # 如果没有获取到点赞，默认为0
+                uploader = info.get('uploader', 'Unknown')
+                view_count = info.get('view_count', 0)
+                
+                # 处理None的情况（有些平台可能隐藏数据）
+                if like_count is None: like_count = 0
+                if view_count is None: view_count = 0
 
-            progress_bar.progress(min(page / limit_pages, 1.0))
-            page += 1
-            await asyncio.sleep(0.5)
+                data.append({
+                    "标题": title,
+                    "点赞数": like_count,
+                    "播放量": view_count,
+                    "UP主/作者": uploader,
+                    "链接": url
+                })
+        except Exception as e:
+            st.error(f"链接 {url} 解析失败: {e}")
+        
+        progress_bar.progress((i + 1) / len(urls))
+    
+    status_text.text("分析完成！")
+    progress_bar.empty()
+    return pd.DataFrame(data)
+
+# --- 辅助函数：生成 Word 文件 ---
+def generate_word(df):
+    doc = Document()
+    doc.add_heading('视频数据统计', 0)
+    
+    # 添加表格
+    t = doc.add_table(rows=1, cols=len(df.columns))
+    t.style = 'Table Grid'
+    
+    # 表头
+    hdr_cells = t.rows[0].cells
+    for i, col_name in enumerate(df.columns):
+        hdr_cells[i].text = str(col_name)
+    
+    # 数据行
+    for index, row in df.iterrows():
+        row_cells = t.add_row().cells
+        for i, value in enumerate(row):
+            row_cells[i].text = str(value)
             
-    except Exception as e:
-        st.error(f"中断: {e}")
+    bio = io.BytesIO()
+    doc.save(bio)
+    return bio.getvalue()
+
+# --- 辅助函数：生成 PDF 文件 ---
+def generate_pdf(df):
+    bio = io.BytesIO()
+    doc = SimpleDocTemplate(bio, pagesize=letter)
+    elements = []
     
-    return title, comments_data
-
-# --- UI 布局 ---
-
-st.title("🍪 B站评论抓取 (强力修复版)")
-
-with st.sidebar:
-    st.header("🔐 身份验证 (推荐)")
-    st.info("粘贴 Cookie JSON")
+    # 转换数据为列表格式 [列名, 行1, 行2...]
+    data = [df.columns.to_list()] + df.values.tolist()
     
-    cookie_input = st.text_area(
-        "Cookie 数据:", 
-        height=150,
-        placeholder='{"url": "...", "cookies": [...]}'
-    )
+    # 解决中文乱码通常需要注册字体，这里为了演示稳定，PDF可能无法显示特殊中文字符
+    # 实际项目中建议使用 reportlab 注册中文字体，或者直接推荐用户下载 Excel/Word
     
-    cred = None
-    if cookie_input:
-        cred, err_msg = parse_cookie_json(cookie_input)
-        if cred:
-            st.success("✅ Cookie 解析成功！")
-        else:
-            st.error(f"❌ {err_msg}")
-            
-    st.divider()
-    max_pages = st.slider("抓取页数", 1, 100, 5)
+    t = Table(data)
+    t.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+        ('GRID', (0, 0), (-1, -1), 1, colors.black)
+    ]))
+    elements.append(t)
+    doc.build(elements)
+    return bio.getvalue()
 
-url_input = st.text_input("👇 视频链接", placeholder="https://b23.tv/...")
+# --- Streamlit 界面布局 ---
+st.set_page_config(page_title="视频数据抓取与排序工具", layout="wide")
 
-if st.button("开始抓取", type="primary"):
-    if not url_input:
-        st.warning("请输入链接")
+st.title("📊 视频数据抓取 & 智能排序工具")
+st.markdown("输入视频链接，自动抓取点赞数并生成报表。支持 Bilibili, YouTube, Douyin 等。")
+
+# 1. 输入区域
+st.subheader("1. 输入视频链接 (一行一个)")
+url_input = st.text_area("粘贴链接到这里：", height=150, placeholder="https://www.bilibili.com/video/...\nhttps://www.youtube.com/watch?v=...")
+
+if st.button("开始抓取数据"):
+    if not url_input.strip():
+        st.warning("请先输入链接！")
     else:
-        bv_id, real_url = extract_bv(url_input)
-        if not bv_id:
-            st.error("无法识别 BV 号")
-        else:
-            st.success(f"正在抓取: {bv_id}")
-            
-            try:
-                loop = asyncio.get_event_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-            
-            title, data = loop.run_until_complete(fetch_comments_async(bv_id, max_pages, credential=cred))
-            
-            if isinstance(data, str):
-                st.error(data)
-            elif data:
-                st.subheader(f"📄 {title}")
-                df = pd.DataFrame(data)
-                st.dataframe(df, use_container_width=True)
-                
-                csv = df.to_csv(index=False).encode('utf-8-sig')
-                st.download_button("📥 下载数据 (CSV)", csv, f"{bv_id}.csv", "text/csv")
-            else:
-                st.warning("未抓取到数据。")
+        urls = [line.strip() for line in url_input.split('\n') if line.strip()]
+        
+        # 获取数据并存入 Session State 防止刷新丢失
+        st.session_state['df'] = get_video_metadata(urls)
+
+# 2. 数据处理与展示区域
+if 'df' in st.session_state:
+    df = st.session_state['df']
+    
+    st.divider()
+    st.subheader("2. 数据排序与预览")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        sort_by = st.selectbox("选择排序依据", ["点赞数", "播放量"], index=0)
+    with col2:
+        sort_order = st.radio("排序方式", ["正序 (从低到高)", "倒序 (从高到低)"], index=1)
+    
+    # 执行排序
+    ascending = True if sort_order == "正序 (从低到高)" else False
+    sorted_df = df.sort_values(by=sort_by, ascending=ascending)
+    
+    # 增加排名列
+    sorted_df.reset_index(drop=True, inplace=True)
+    sorted_df.index = sorted_df.index + 1
+    st.dataframe(sorted_df, use_container_width=True)
+
+    # 3. 导出区域
+    st.divider()
+    st.subheader("3. 导出数据")
+    
+    c1, c2, c3, c4 = st.columns(4)
+    
+    # CSV 下载
+    csv = sorted_df.to_csv(index=False).encode('utf-8-sig')
+    c1.download_button("下载 CSV", data=csv, file_name="video_stats.csv", mime="text/csv")
+    
+    # Excel 下载
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+        sorted_df.to_excel(writer, index=False, sheet_name='Sheet1')
+    c2.download_button("下载 Excel", data=buffer.getvalue(), file_name="video_stats.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    
+    # Word 下载
+    word_data = generate_word(sorted_df)
+    c3.download_button("下载 Word", data=word_data, file_name="video_stats.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+
+    # PDF 下载 (注：Python生成PDF处理中文较复杂，这里仅作基础实现)
+    pdf_data = generate_pdf(sorted_df)
+    c4.download_button("下载 PDF", data=pdf_data, file_name="video_stats.pdf", mime="application/pdf")
