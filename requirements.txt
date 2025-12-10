@@ -9,3 +9,4 @@ openpyxl
 yt-dlp
 pandas
 fpdf
+reportlab
