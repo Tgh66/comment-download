@@ -10,7 +10,7 @@ from bilibili_api import video, comment, Credential
 from bilibili_api.exceptions import ResponseCodeException
 
 # --- 页面配置 ---
-st.set_page_config(page_title="B站评论抓取神器 (最终版)", page_icon="🍪", layout="wide")
+st.set_page_config(page_title="B站评论抓取神器 ", page_icon="🍪", layout="wide")
 
 # --- 辅助函数 ---
 
@@ -35,9 +35,7 @@ def extract_bv(url):
     return None, real_url
 
 def parse_cookie_json(json_str):
-    """
-    解析用户粘贴的 JSON Cookie 数据
-    """
+    """解析用户粘贴的 JSON Cookie 数据"""
     try:
         data = json.loads(json_str)
         
@@ -69,9 +67,13 @@ def parse_cookie_json(json_str):
     except Exception as e:
         return None, f"Cookie 解析错误: {str(e)}"
 
+# 👇 【核心修复】定义一个自定义类，完美骗过库的检查
+class VideoTypeFix:
+    value = 1  # 视频类型 ID 为 1
+
 async def fetch_comments_async(bv_id, limit_pages, credential=None):
     """
-    异步抓取评论 (已修复 ResourceType 错误)
+    异步抓取评论
     """
     v = video.Video(bvid=bv_id, credential=credential)
     
@@ -93,9 +95,8 @@ async def fetch_comments_async(bv_id, limit_pages, credential=None):
             status_text.text(f"🚀 正在抓取第 {page}/{limit_pages} 页...")
             
             try:
-                # 修复核心：直接使用数字 1 代表视频评论类型，避免 AttributeError
-                # type_=1 (视频), type_=12 (专栏), type_=17 (动态)
-                c = await comment.get_comments(oid, 1, page, credential=credential)
+                # 👇 【关键修改】使用自定义对象 VideoTypeFix() 代替数字 1
+                c = await comment.get_comments(oid, VideoTypeFix(), page, credential=credential)
             except ResponseCodeException as e:
                 if e.code == -404: break
                 st.warning(f"API 错误代码: {e.code}")
@@ -140,14 +141,14 @@ async def fetch_comments_async(bv_id, limit_pages, credential=None):
 
 # --- UI 布局 ---
 
-st.title("🍪 B站评论抓取 (含登录)")
+st.title("🍪 B站评论抓取 (强力修复版)")
 
 with st.sidebar:
     st.header("🔐 身份验证 (推荐)")
-    st.info("粘贴 Cookie 可以大幅提高抓取成功率。")
+    st.info("粘贴 Cookie JSON")
     
     cookie_input = st.text_area(
-        "在此粘贴 Cookie JSON 数据:", 
+        "Cookie 数据:", 
         height=150,
         placeholder='{"url": "...", "cookies": [...]}'
     )
@@ -163,7 +164,7 @@ with st.sidebar:
     st.divider()
     max_pages = st.slider("抓取页数", 1, 100, 5)
 
-url_input = st.text_input("👇 视频链接 (支持短链)", placeholder="https://b23.tv/...")
+url_input = st.text_input("👇 视频链接", placeholder="https://b23.tv/...")
 
 if st.button("开始抓取", type="primary"):
     if not url_input:
