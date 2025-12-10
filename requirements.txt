@@ -1,0 +1,4 @@
+streamlit
+bilibili-api-python
+pandas
+requests
