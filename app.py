@@ -8,6 +8,7 @@ import json
 import urllib.parse
 import io 
 import os
+import math  # 新增：用于计算页数
 from bilibili_api import video, comment, Credential
 from bilibili_api.exceptions import ResponseCodeException
 
@@ -20,7 +21,7 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 
 # --- 页面配置 ---
-st.set_page_config(page_title="B站评论抓取神器 (完美PDF版)", page_icon="🍪", layout="wide")
+st.set_page_config(page_title="B站评论抓取神器 (并发版)", page_icon="⚡", layout="wide")
 
 # --- 初始化 Session State ---
 if 'comments_data' not in st.session_state:
@@ -110,7 +111,6 @@ def create_pdf(dataframe, title):
         title_style.fontName = font_name
     
     # 正文内容样式 (用于表格内的长文本自动换行)
-    # leading 是行间距，fontSize 是字号
     cell_style = ParagraphStyle(
         name='CellStyle',
         fontName=font_name,
@@ -124,8 +124,6 @@ def create_pdf(dataframe, title):
     elements.append(Paragraph("<br/><br/>", styles['Normal']))
 
     # 3. 准备表格数据
-    # 定义列宽 (单位: point, A4 宽度约为 595, 去掉页边距可用约 450-500)
-    # 列顺序: 用户名, 内容, 点赞, 时间, 回复数
     col_widths = [70, 240, 40, 80, 40] 
 
     # 处理表头
@@ -136,7 +134,6 @@ def create_pdf(dataframe, title):
     for index, row in dataframe.iterrows():
         new_row = []
         
-        # 提取每一列的数据
         uname = str(row['用户名'])
         content = str(row['内容'])
         like = str(row['点赞'])
@@ -147,30 +144,28 @@ def create_pdf(dataframe, title):
         content = re.sub(r'[^\x00-\x7F\u4e00-\u9fa5]+', '', content)
         uname = re.sub(r'[^\x00-\x7F\u4e00-\u9fa5]+', '', uname)
 
-        # 【核心逻辑】将长文本转换为 Paragraph 对象，实现自动换行
-        # 其他短字段可以直接用字符串，或者也转为 Paragraph 以保持格式统一
-        # 这里我们将 内容(索引1) 设为 Paragraph
-        new_row.append(Paragraph(uname, cell_style)) # 用户名也可能长，加上保险
-        new_row.append(Paragraph(content, cell_style)) # 内容必须换行
+        # 转换为 Paragraph 对象
+        new_row.append(Paragraph(uname, cell_style)) 
+        new_row.append(Paragraph(content, cell_style))
         new_row.append(like)
-        new_row.append(time_str) # 时间通常固定宽度
+        new_row.append(time_str) 
         new_row.append(reply_count)
 
         processed_data.append(new_row)
 
-    # 4. 创建表格对象，传入列宽参数
+    # 4. 创建表格对象
     t = Table(processed_data, colWidths=col_widths)
     
     # 5. 设置表格样式
     style = TableStyle([
         ('FONTNAME', (0, 0), (-1, -1), font_name), 
-        ('BACKGROUND', (0, 0), (-1, 0), colors.grey), # 表头背景
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke), # 表头文字颜色
-        ('ALIGN', (0, 0), (-1, 0), 'CENTER'), # 表头居中
-        ('VALIGN', (0, 0), (-1, -1), 'TOP'), # 所有单元格内容顶对齐 (对长文很重要)
+        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
         ('FONTSIZE', (0, 0), (-1, 0), 10),
         ('FONTSIZE', (0, 0), (-1, -1), 9),
-        ('GRID', (0, 0), (-1, -1), 0.5, colors.black), # 表格线
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.black),
         ('LEFTPADDING', (0, 0), (-1, -1), 4),
         ('RIGHTPADDING', (0, 0), (-1, -1), 4),
         ('TOPPADDING', (0, 0), (-1, -1), 4),
@@ -192,9 +187,23 @@ def create_pdf(dataframe, title):
 class VideoTypeFix:
     value = 1 
 
-async def fetch_comments_async(bv_id, limit_pages, credential=None):
+# --- 新增：处理单页抓取的包装函数 ---
+async def fetch_one_page(oid, page, credential, semaphore):
     """
-    异步抓取评论
+    单个页面抓取任务，受信号量控制并发数
+    """
+    async with semaphore:  # 限制同时运行的任务数量
+        try:
+            # 随机短暂休眠，防止触发 B 站风控
+            await asyncio.sleep(0.05)
+            c = await comment.get_comments(oid, VideoTypeFix(), page, credential=credential)
+            return c
+        except Exception as e:
+            return None
+
+async def fetch_comments_async(bv_id, fetch_mode, limit_pages, credential=None):
+    """
+    异步并发抓取评论 (核心重构)
     """
     v = video.Video(bvid=bv_id, credential=credential)
     
@@ -206,62 +215,100 @@ async def fetch_comments_async(bv_id, limit_pages, credential=None):
         return None, f"无法获取视频信息: {str(e)}"
 
     comments_data = []
-    page = 1
     
+    # 进度显示
     progress_bar = st.progress(0)
     status_text = st.empty()
-    
+    status_text.text("🚀 正在初始化...")
+
+    # --- 第一步：抓取第1页，获取总页数信息 ---
     try:
-        while page <= limit_pages:
-            status_text.text(f"🚀 正在抓取第 {page}/{limit_pages} 页...")
-            
-            try:
-                c = await comment.get_comments(oid, VideoTypeFix(), page, credential=credential)
-            except ResponseCodeException as e:
-                if e.code == -404: break
-                st.warning(f"API 错误代码: {e.code}")
-                break
-            except Exception as e:
-                st.warning(f"未知错误: {e}")
-                break
+        page_1_data = await comment.get_comments(oid, VideoTypeFix(), 1, credential=credential)
+    except ResponseCodeException as e:
+        return None, f"抓取第1页失败，错误码: {e.code}"
+    
+    if not page_1_data:
+        return title, []
 
-            if 'replies' not in c or not c['replies']:
-                status_text.text("✅ 已到达底部")
-                break
-            
-            for r in c['replies']:
-                item = {
-                    '用户名': r['member']['uname'],
-                    '内容': r['content']['message'],
-                    '点赞': int(r['like']), 
-                    '时间': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(r['ctime'])),
-                    '回复数': int(r['count'])
-                }
-                comments_data.append(item)
-                
-                if r.get('replies'):
-                    for sub in r['replies']:
-                        sub_item = {
-                            '用户名': sub['member']['uname'],
-                            '内容': f"[回复] {sub['content']['message']}",
-                            '点赞': int(sub['like']),
-                            '时间': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(sub['ctime'])),
-                            '回复数': 0
-                        }
-                        comments_data.append(sub_item)
+    # 计算总页数
+    page_info = page_1_data.get('page', {})
+    total_count = page_info.get('count', 0)
+    total_pages_available = math.ceil(total_count / 20) # B站每页20条
+    
+    # 确定目标抓取页数
+    if fetch_mode == "全部下载":
+        target_pages = total_pages_available
+        status_text.text(f"检测到共 {total_count} 条评论，约 {target_pages} 页，准备全部下载...")
+    else:
+        target_pages = min(total_pages_available, limit_pages)
+        status_text.text(f"准备下载前 {target_pages} 页...")
 
-            progress_bar.progress(min(page / limit_pages, 1.0))
-            page += 1
-            await asyncio.sleep(0.5)
+    # 先处理第1页的数据
+    def process_comments_json(c_json):
+        processed = []
+        if 'replies' not in c_json or not c_json['replies']:
+            return processed
             
-    except Exception as e:
-        st.error(f"中断: {e}")
+        for r in c_json['replies']:
+            item = {
+                '用户名': r['member']['uname'],
+                '内容': r['content']['message'],
+                '点赞': int(r['like']), 
+                '时间': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(r['ctime'])),
+                '回复数': int(r['count'])
+            }
+            processed.append(item)
+            if r.get('replies'):
+                for sub in r['replies']:
+                    sub_item = {
+                        '用户名': sub['member']['uname'],
+                        '内容': f"[回复] {sub['content']['message']}",
+                        '点赞': int(sub['like']),
+                        '时间': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(sub['ctime'])),
+                        '回复数': 0
+                    }
+                    processed.append(sub_item)
+        return processed
+
+    comments_data.extend(process_comments_json(page_1_data))
+    progress_bar.progress(1 / max(target_pages, 1))
+
+    # --- 第二步：并发抓取剩余页面 (如果有) ---
+    if target_pages > 1:
+        # 限制并发数为 5 (太高会被封)
+        sem = asyncio.Semaphore(5)
+        tasks = []
+        
+        # 创建任务列表 (从第2页开始)
+        for p in range(2, target_pages + 1):
+            task = fetch_one_page(oid, p, credential, sem)
+            tasks.append(task)
+        
+        # 运行并发任务
+        finished_count = 1 # 已经抓了第1页
+        
+        # as_completed 允许我们每完成一个任务就更新一次 UI
+        for future in asyncio.as_completed(tasks):
+            result = await future
+            finished_count += 1
+            
+            if result:
+                new_items = process_comments_json(result)
+                comments_data.extend(new_items)
+            
+            # 更新进度条
+            progress = min(finished_count / target_pages, 1.0)
+            progress_bar.progress(progress)
+            status_text.text(f"⚡ 正在并发下载: {finished_count}/{target_pages} 页...")
+
+    status_text.text("✅ 下载完成！")
+    await asyncio.sleep(0.5)
     
     return title, comments_data
 
 # --- UI 布局 ---
 
-st.title("🍪 B站评论抓取 (完美PDF版)")
+st.title("⚡ B站评论抓取 (并发下载+全量版)")
 
 with st.sidebar:
     st.header("🔐 身份验证 (推荐)")
@@ -282,7 +329,19 @@ with st.sidebar:
             st.error(f"❌ {err_msg}")
             
     st.divider()
-    max_pages = st.slider("抓取页数", 1, 100, 5)
+    
+    # --- UI 修改：增加模式选择 ---
+    st.header("⚙️ 下载设置")
+    fetch_mode = st.radio(
+        "下载模式",
+        ("指定页数", "全部下载")
+    )
+    
+    limit_pages = 5 # 默认值
+    if fetch_mode == "指定页数":
+        limit_pages = st.slider("选择抓取页数", 1, 100, 5)
+    else:
+        st.caption("⚠️ 注意：'全部下载'可能耗时较长，且容易触发B站风控，请确保已登录Cookie。")
 
 url_input = st.text_input("👇 视频链接", placeholder="https://b23.tv/...")
 
@@ -302,7 +361,8 @@ if st.button("开始抓取", type="primary"):
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
             
-            title, data = loop.run_until_complete(fetch_comments_async(bv_id, max_pages, credential=cred))
+            # 调用修改后的并发函数
+            title, data = loop.run_until_complete(fetch_comments_async(bv_id, fetch_mode, limit_pages, credential=cred))
             
             if isinstance(data, str):
                 st.error(data)
