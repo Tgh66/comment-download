@@ -14,6 +14,8 @@ from bilibili_api.exceptions import ResponseCodeException
 # --- PDF 生成相关库 ---
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfbase import pdfmetrics
+# 👇 【关键修改】不再引入 TTF，改为引入 CIDFont，解决报错问题
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont 
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib import colors
@@ -84,7 +86,7 @@ def parse_cookie_json(json_str):
     except Exception as e:
         return None, f"Cookie 解析错误: {str(e)}"
 
-# --- PDF 生成函数 (修复字体路径版) ---
+# --- PDF 生成函数 (CID 字体版 - 无需本地字体文件) ---
 def create_pdf(dataframe, title):
     """
     将 DataFrame 转换为 PDF 字节流
@@ -93,36 +95,22 @@ def create_pdf(dataframe, title):
     doc = SimpleDocTemplate(buffer, pagesize=A4)
     elements = []
 
-    # 1. 注册字体 (核心修改：优先读取项目目录下的字体文件)
-    font_name = "Helvetica" # 默认英文作为保底
-    
-    # 你的字体文件名，必须和你上传到 GitHub 的文件名完全一致！
-    font_file = "SimHei.ttf" 
-    
-    # 获取当前脚本所在的绝对路径，确保在云端也能找到文件
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    font_path = os.path.join(current_dir, font_file)
-
-    if os.path.exists(font_path):
-        try:
-            # 注册项目文件夹里的字体
-            pdfmetrics.registerFont(TTF('SimHei', font_path))
-            font_name = 'SimHei'
-        except Exception as e:
-            print(f"字体注册失败: {e}")
-    else:
-        # 如果找不到文件，尝试系统的（本地调试用）
-        try:
-            pdfmetrics.registerFont(TTF('SimHei', 'simhei.ttf')) # Windows 默认路径尝试
-            font_name = 'SimHei'
-        except:
-            pass
+    # 1. 注册 CID 中文字体 (STSong-Light 是标准宋体)
+    # 这种方式不需要 TTF 模块，也不需要上传字体文件，不会报错
+    font_name = 'STSong-Light'
+    try:
+        pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))
+    except Exception as e:
+        # 如果连 STSong 都不支持，回退到默认（虽然会乱码，但保证不崩）
+        print(f"字体注册警告: {e}")
+        font_name = "Helvetica"
 
     # 2. 准备标题
     styles = getSampleStyleSheet()
     title_style = styles['Title']
-    # 如果加载了中文体，应用到标题
-    if font_name == 'SimHei':
+    
+    # 重新定义标题样式以支持中文
+    if font_name == 'STSong-Light':
         title_style.fontName = font_name
     
     safe_title = re.sub(r'[^\w\s\u4e00-\u9fa5]', '', title)
@@ -139,7 +127,7 @@ def create_pdf(dataframe, title):
             str_item = str(item)
             if len(str_item) > 50:
                 str_item = str_item[:50] + "..."
-            # 清理特殊字符
+            # 清理 PDF 不支持的特殊字符（保留中文和基础符号）
             str_item = re.sub(r'[^\x00-\x7F\u4e00-\u9fa5]+', '', str_item) 
             new_row.append(str_item)
         processed_data.append(new_row)
@@ -149,7 +137,7 @@ def create_pdf(dataframe, title):
     
     # 5. 设置表格样式
     style = TableStyle([
-        ('FONTNAME', (0, 0), (-1, -1), font_name), # 全局应用该字体
+        ('FONTNAME', (0, 0), (-1, -1), font_name), # 全局应用中文字体
         ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
         ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
         ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
