@@ -14,16 +14,15 @@ from bilibili_api.exceptions import ResponseCodeException
 # --- PDF 生成相关库 ---
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfbase import pdfmetrics
-# 👇 【关键修改】不再引入 TTF，改为引入 CIDFont，解决报错问题
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont 
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 
 # --- 页面配置 ---
-st.set_page_config(page_title="B站评论抓取神器 (排序+PDF版)", page_icon="🍪", layout="wide")
+st.set_page_config(page_title="B站评论抓取神器 (完美PDF版)", page_icon="🍪", layout="wide")
 
-# --- 初始化 Session State (用于持久化保存数据) ---
+# --- 初始化 Session State ---
 if 'comments_data' not in st.session_state:
     st.session_state.comments_data = None
 if 'video_title' not in st.session_state:
@@ -86,65 +85,96 @@ def parse_cookie_json(json_str):
     except Exception as e:
         return None, f"Cookie 解析错误: {str(e)}"
 
-# --- PDF 生成函数 (CID 字体版 - 无需本地字体文件) ---
+# --- PDF 生成函数 (自动换行 + 完整显示版) ---
 def create_pdf(dataframe, title):
     """
-    将 DataFrame 转换为 PDF 字节流
+    将 DataFrame 转换为 PDF 字节流 (支持自动换行)
     """
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4)
     elements = []
 
-    # 1. 注册 CID 中文字体 (STSong-Light 是标准宋体)
-    # 这种方式不需要 TTF 模块，也不需要上传字体文件，不会报错
+    # 1. 注册 CID 中文字体
     font_name = 'STSong-Light'
     try:
         pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))
     except Exception as e:
-        # 如果连 STSong 都不支持，回退到默认（虽然会乱码，但保证不崩）
-        print(f"字体注册警告: {e}")
         font_name = "Helvetica"
 
-    # 2. 准备标题
+    # 2. 定义样式
     styles = getSampleStyleSheet()
-    title_style = styles['Title']
     
-    # 重新定义标题样式以支持中文
+    # 标题样式
+    title_style = styles['Title']
     if font_name == 'STSong-Light':
         title_style.fontName = font_name
     
+    # 正文内容样式 (用于表格内的长文本自动换行)
+    # leading 是行间距，fontSize 是字号
+    cell_style = ParagraphStyle(
+        name='CellStyle',
+        fontName=font_name,
+        fontSize=9,
+        leading=12,
+        wordWrap='CJK' # 支持中文断行
+    )
+
     safe_title = re.sub(r'[^\w\s\u4e00-\u9fa5]', '', title)
     elements.append(Paragraph(f"视频评论: {safe_title}", title_style))
     elements.append(Paragraph("<br/><br/>", styles['Normal']))
 
     # 3. 准备表格数据
-    data = [dataframe.columns.to_list()] + dataframe.values.tolist()
+    # 定义列宽 (单位: point, A4 宽度约为 595, 去掉页边距可用约 450-500)
+    # 列顺序: 用户名, 内容, 点赞, 时间, 回复数
+    col_widths = [70, 240, 40, 80, 40] 
 
-    processed_data = []
-    for row in data:
+    # 处理表头
+    headers = dataframe.columns.to_list()
+    processed_data = [headers]
+
+    # 处理每一行数据
+    for index, row in dataframe.iterrows():
         new_row = []
-        for item in row:
-            str_item = str(item)
-            if len(str_item) > 50:
-                str_item = str_item[:50] + "..."
-            # 清理 PDF 不支持的特殊字符（保留中文和基础符号）
-            str_item = re.sub(r'[^\x00-\x7F\u4e00-\u9fa5]+', '', str_item) 
-            new_row.append(str_item)
+        
+        # 提取每一列的数据
+        uname = str(row['用户名'])
+        content = str(row['内容'])
+        like = str(row['点赞'])
+        time_str = str(row['时间'])
+        reply_count = str(row['回复数'])
+
+        # 清理 PDF 不支持的字符
+        content = re.sub(r'[^\x00-\x7F\u4e00-\u9fa5]+', '', content)
+        uname = re.sub(r'[^\x00-\x7F\u4e00-\u9fa5]+', '', uname)
+
+        # 【核心逻辑】将长文本转换为 Paragraph 对象，实现自动换行
+        # 其他短字段可以直接用字符串，或者也转为 Paragraph 以保持格式统一
+        # 这里我们将 内容(索引1) 设为 Paragraph
+        new_row.append(Paragraph(uname, cell_style)) # 用户名也可能长，加上保险
+        new_row.append(Paragraph(content, cell_style)) # 内容必须换行
+        new_row.append(like)
+        new_row.append(time_str) # 时间通常固定宽度
+        new_row.append(reply_count)
+
         processed_data.append(new_row)
 
-    # 4. 创建表格对象
-    t = Table(processed_data)
+    # 4. 创建表格对象，传入列宽参数
+    t = Table(processed_data, colWidths=col_widths)
     
     # 5. 设置表格样式
     style = TableStyle([
-        ('FONTNAME', (0, 0), (-1, -1), font_name), # 全局应用中文字体
-        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('FONTNAME', (0, 0), (-1, -1), font_name), 
+        ('BACKGROUND', (0, 0), (-1, 0), colors.grey), # 表头背景
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke), # 表头文字颜色
+        ('ALIGN', (0, 0), (-1, 0), 'CENTER'), # 表头居中
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'), # 所有单元格内容顶对齐 (对长文很重要)
         ('FONTSIZE', (0, 0), (-1, 0), 10),
-        ('FONTSIZE', (0, 0), (-1, -1), 8),
-        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-        ('GRID', (0, 0), (-1, -1), 1, colors.black),
+        ('FONTSIZE', (0, 0), (-1, -1), 9),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.black), # 表格线
+        ('LEFTPADDING', (0, 0), (-1, -1), 4),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 4),
+        ('TOPPADDING', (0, 0), (-1, -1), 4),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
     ])
     t.setStyle(style)
     elements.append(t)
@@ -158,9 +188,9 @@ def create_pdf(dataframe, title):
         print(f"PDF生成错误: {e}")
         return None
 
-# 👇 【核心修复】定义一个自定义类，完美骗过库的检查
+# 👇 自定义类
 class VideoTypeFix:
-    value = 1  # 视频类型 ID 为 1
+    value = 1 
 
 async def fetch_comments_async(bv_id, limit_pages, credential=None):
     """
@@ -186,7 +216,6 @@ async def fetch_comments_async(bv_id, limit_pages, credential=None):
             status_text.text(f"🚀 正在抓取第 {page}/{limit_pages} 页...")
             
             try:
-                # 👇 【关键修改】使用自定义对象 VideoTypeFix() 代替数字 1
                 c = await comment.get_comments(oid, VideoTypeFix(), page, credential=credential)
             except ResponseCodeException as e:
                 if e.code == -404: break
@@ -204,7 +233,7 @@ async def fetch_comments_async(bv_id, limit_pages, credential=None):
                 item = {
                     '用户名': r['member']['uname'],
                     '内容': r['content']['message'],
-                    '点赞': int(r['like']), # 确保转换为数字，方便排序
+                    '点赞': int(r['like']), 
                     '时间': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(r['ctime'])),
                     '回复数': int(r['count'])
                 }
@@ -232,7 +261,7 @@ async def fetch_comments_async(bv_id, limit_pages, credential=None):
 
 # --- UI 布局 ---
 
-st.title("🍪 B站评论抓取 (排序+PDF版)")
+st.title("🍪 B站评论抓取 (完美PDF版)")
 
 with st.sidebar:
     st.header("🔐 身份验证 (推荐)")
@@ -257,7 +286,7 @@ with st.sidebar:
 
 url_input = st.text_input("👇 视频链接", placeholder="https://b23.tv/...")
 
-# === 第一部分：抓取逻辑 ===
+# === 抓取 ===
 if st.button("开始抓取", type="primary"):
     if not url_input:
         st.warning("请输入链接")
@@ -267,32 +296,28 @@ if st.button("开始抓取", type="primary"):
             st.error("无法识别 BV 号")
         else:
             st.success(f"正在抓取: {bv_id}")
-            
             try:
                 loop = asyncio.get_event_loop()
             except RuntimeError:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
             
-            # 抓取数据
             title, data = loop.run_until_complete(fetch_comments_async(bv_id, max_pages, credential=cred))
             
             if isinstance(data, str):
                 st.error(data)
             elif data:
-                # 【重要修改】将数据存入 Session State，而不是直接显示
                 st.session_state.comments_data = data
                 st.session_state.video_title = title
                 st.session_state.bv_id = bv_id
-                st.rerun() # 强制刷新页面，进入下方的显示逻辑
+                st.rerun()
             else:
                 st.warning("未抓取到数据。")
 
-# === 第二部分：显示与操作逻辑 (只要 Session State 里有数据就显示) ===
+# === 显示 ===
 if st.session_state.comments_data:
     st.divider()
     
-    # 从 State 中读取数据
     title = st.session_state.video_title
     bv_id = st.session_state.bv_id
     data = st.session_state.comments_data
@@ -301,19 +326,16 @@ if st.session_state.comments_data:
     
     df = pd.DataFrame(data)
     
-    # 布局容器
     col1, col2 = st.columns([3, 1])
     
     with col2:
         st.markdown("### 🛠️ 数据选项")
         
-        # 1. 排序选择
         sort_order = st.radio(
             "排序方式 (按点赞)",
             ("默认 (时间)", "点赞数 (高到低)", "点赞数 (低到高)")
         )
         
-        # 2. 应用排序
         if sort_order == "点赞数 (高到低)":
             df = df.sort_values(by="点赞", ascending=False)
         elif sort_order == "点赞数 (低到高)":
@@ -321,7 +343,6 @@ if st.session_state.comments_data:
         
         st.write(f"共抓取 {len(df)} 条评论")
         
-        # 3. CSV 下载
         csv = df.to_csv(index=False).encode('utf-8-sig')
         st.download_button(
             label="📥 下载 CSV",
@@ -330,12 +351,9 @@ if st.session_state.comments_data:
             mime="text/csv"
         )
         
-        # 4. PDF 下载
         st.write("---")
-        # 这里使用嵌套 Button 逻辑，当点击生成后，数据依然存在，所以不会跳回首页
         if st.button("生成 PDF"):
-            with st.spinner("正在生成 PDF (可能需要几秒)..."):
-                # 使用当前排序后的 df 生成 PDF
+            with st.spinner("正在生成 PDF (支持长文换行)..."):
                 pdf_buffer = create_pdf(df, title)
                 if pdf_buffer:
                     st.success("生成成功！")
@@ -349,10 +367,8 @@ if st.session_state.comments_data:
                     st.error("PDF 生成失败。")
 
     with col1:
-        # 展示表格 (会展示排序后的结果)
         st.dataframe(df, use_container_width=True, height=500)
         
-    # 如果想清除结果，给个重置按钮
     if st.button("🔄 清空结果"):
         st.session_state.comments_data = None
         st.rerun()
