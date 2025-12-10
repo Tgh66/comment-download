@@ -6,7 +6,8 @@ import time
 import requests
 import json
 import urllib.parse
-import io # 新增：用于处理字节流
+import io 
+import os
 from bilibili_api import video, comment, Credential
 from bilibili_api.exceptions import ResponseCodeException
 
