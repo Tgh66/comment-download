@@ -6,4 +6,5 @@ httpx
 reportlab
 python-docx
 openpyxl
+yt-dlp
 pandas
