@@ -14,12 +14,21 @@ from bilibili_api.exceptions import ResponseCodeException
 # --- PDF 生成相关库 ---
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTF
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib import colors
 
 # --- 页面配置 ---
 st.set_page_config(page_title="B站评论抓取神器 (排序+PDF版)", page_icon="🍪", layout="wide")
+
+# --- 初始化 Session State (用于持久化保存数据) ---
+if 'comments_data' not in st.session_state:
+    st.session_state.comments_data = None
+if 'video_title' not in st.session_state:
+    st.session_state.video_title = ""
+if 'bv_id' not in st.session_state:
+    st.session_state.bv_id = ""
 
 # --- 辅助函数 ---
 
@@ -261,6 +270,7 @@ with st.sidebar:
 
 url_input = st.text_input("👇 视频链接", placeholder="https://b23.tv/...")
 
+# === 第一部分：抓取逻辑 ===
 if st.button("开始抓取", type="primary"):
     if not url_input:
         st.warning("请输入链接")
@@ -277,65 +287,85 @@ if st.button("开始抓取", type="primary"):
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
             
+            # 抓取数据
             title, data = loop.run_until_complete(fetch_comments_async(bv_id, max_pages, credential=cred))
             
             if isinstance(data, str):
                 st.error(data)
             elif data:
-                st.divider()
-                st.subheader(f"📄 {title}")
-                
-                # --- 新增功能：排序与处理 ---
-                df = pd.DataFrame(data)
-                
-                # 布局容器：左边展示数据，右边放下载按钮和排序
-                col1, col2 = st.columns([3, 1])
-                
-                with col2:
-                    st.markdown("### 🛠️ 数据选项")
-                    
-                    # 1. 排序选择
-                    sort_order = st.radio(
-                        "排序方式 (按点赞)",
-                        ("默认 (时间)", "点赞数 (高到低)", "点赞数 (低到高)")
-                    )
-                    
-                    # 2. 应用排序
-                    if sort_order == "点赞数 (高到低)":
-                        df = df.sort_values(by="点赞", ascending=False)
-                    elif sort_order == "点赞数 (低到高)":
-                        df = df.sort_values(by="点赞", ascending=True)
-                    
-                    st.write(f"共抓取 {len(df)} 条评论")
-                    
-                    # 3. CSV 下载
-                    csv = df.to_csv(index=False).encode('utf-8-sig')
-                    st.download_button(
-                        label="📥 下载 CSV",
-                        data=csv,
-                        file_name=f"{bv_id}_comments.csv",
-                        mime="text/csv"
-                    )
-                    
-                    # 4. PDF 下载 (带状态提示)
-                    st.write("---")
-                    if st.button("生成 PDF"):
-                        with st.spinner("正在生成 PDF (可能需要几秒)..."):
-                            pdf_buffer = create_pdf(df, title)
-                            if pdf_buffer:
-                                st.success("PDF 生成成功！请点击下方按钮下载")
-                                st.download_button(
-                                    label="📥 点击下载 PDF",
-                                    data=pdf_buffer,
-                                    file_name=f"{bv_id}_comments.pdf",
-                                    mime="application/pdf"
-                                )
-                            else:
-                                st.error("PDF 生成失败，可能因包含特殊字符或字体问题。")
-
-                with col1:
-                    # 展示表格
-                    st.dataframe(df, use_container_width=True, height=500)
-                
+                # 【重要修改】将数据存入 Session State，而不是直接显示
+                st.session_state.comments_data = data
+                st.session_state.video_title = title
+                st.session_state.bv_id = bv_id
+                st.rerun() # 强制刷新页面，进入下方的显示逻辑
             else:
                 st.warning("未抓取到数据。")
+
+# === 第二部分：显示与操作逻辑 (只要 Session State 里有数据就显示) ===
+if st.session_state.comments_data:
+    st.divider()
+    
+    # 从 State 中读取数据
+    title = st.session_state.video_title
+    bv_id = st.session_state.bv_id
+    data = st.session_state.comments_data
+    
+    st.subheader(f"📄 {title}")
+    
+    df = pd.DataFrame(data)
+    
+    # 布局容器
+    col1, col2 = st.columns([3, 1])
+    
+    with col2:
+        st.markdown("### 🛠️ 数据选项")
+        
+        # 1. 排序选择
+        sort_order = st.radio(
+            "排序方式 (按点赞)",
+            ("默认 (时间)", "点赞数 (高到低)", "点赞数 (低到高)")
+        )
+        
+        # 2. 应用排序
+        if sort_order == "点赞数 (高到低)":
+            df = df.sort_values(by="点赞", ascending=False)
+        elif sort_order == "点赞数 (低到高)":
+            df = df.sort_values(by="点赞", ascending=True)
+        
+        st.write(f"共抓取 {len(df)} 条评论")
+        
+        # 3. CSV 下载
+        csv = df.to_csv(index=False).encode('utf-8-sig')
+        st.download_button(
+            label="📥 下载 CSV",
+            data=csv,
+            file_name=f"{bv_id}_comments.csv",
+            mime="text/csv"
+        )
+        
+        # 4. PDF 下载
+        st.write("---")
+        # 这里使用嵌套 Button 逻辑，当点击生成后，数据依然存在，所以不会跳回首页
+        if st.button("生成 PDF"):
+            with st.spinner("正在生成 PDF (可能需要几秒)..."):
+                # 使用当前排序后的 df 生成 PDF
+                pdf_buffer = create_pdf(df, title)
+                if pdf_buffer:
+                    st.success("生成成功！")
+                    st.download_button(
+                        label="📥 点击下载 PDF",
+                        data=pdf_buffer,
+                        file_name=f"{bv_id}_comments.pdf",
+                        mime="application/pdf"
+                    )
+                else:
+                    st.error("PDF 生成失败。")
+
+    with col1:
+        # 展示表格 (会展示排序后的结果)
+        st.dataframe(df, use_container_width=True, height=500)
+        
+    # 如果想清除结果，给个重置按钮
+    if st.button("🔄 清空结果"):
+        st.session_state.comments_data = None
+        st.rerun()
